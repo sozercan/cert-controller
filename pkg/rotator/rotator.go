@@ -76,9 +76,9 @@ func init() {
 
 func (w WebhookInfo) gvk() schema.GroupVersionKind {
 	t2g := map[WebhookType]schema.GroupVersionKind{
-		Validating:    schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingWebhookConfiguration"},
-		Mutating:      schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingWebhookConfiguration"},
-		CRDConversion: schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1beta1", Kind: "CustomResourceDefinition"},
+		Validating:    {Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingWebhookConfiguration"},
+		Mutating:      {Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingWebhookConfiguration"},
+		CRDConversion: {Group: "apiextensions.k8s.io", Version: "v1beta1", Kind: "CustomResourceDefinition"},
 	}
 	return t2g[w.Type]
 }
@@ -146,7 +146,7 @@ func addNamespacedCache(mgr manager.Manager, namespace string) (cache.Cache, err
 // SyncingSource is a reader that needs syncing prior to being usable.
 type SyncingReader interface {
 	client.Reader
-	WaitForCacheSync(stop <-chan struct{}) bool
+	WaitForCacheSync(ctx context.Context) bool
 }
 
 // CertRotator contains cert artifacts and a channel to close when the certs are ready.
@@ -167,11 +167,11 @@ type CertRotator struct {
 }
 
 // Start starts the CertRotator runnable to rotate certs and ensure the certs are ready.
-func (cr *CertRotator) Start(stop <-chan struct{}) error {
+func (cr *CertRotator) Start(ctx context.Context) error {
 	if cr.reader == nil {
 		return errors.New("nil reader")
 	}
-	if !cr.reader.WaitForCacheSync(stop) {
+	if !cr.reader.WaitForCacheSync(ctx) {
 		return errors.New("failed waiting for reader to sync")
 	}
 
@@ -197,7 +197,7 @@ tickerLoop:
 			if err := cr.refreshCertIfNeeded(); err != nil {
 				crLog.Error(err, "error rotating certs")
 			}
-		case <-stop:
+		case <-ctx.Done():
 			break tickerLoop
 		case <-cr.certsNotMounted:
 			return errors.New("could not mount certs")
@@ -540,40 +540,30 @@ func ValidCert(caCert, cert, key []byte, dnsName string, at time.Time) (bool, er
 // controller code for making sure the CA cert on the
 // webhooks don't get clobbered
 
-var _ handler.Mapper = &crdMapper{}
-
-type crdMapper struct {
-	secretKey types.NamespacedName
-	crdNames  []string
-}
-
-func (m *crdMapper) Map(object handler.MapObject) []reconcile.Request {
-	if object.Meta.GetNamespace() != "" {
-		return nil
-	}
-	for _, crdName := range m.crdNames {
-		if object.Meta.GetName() == crdName {
-			return []reconcile.Request{{NamespacedName: m.secretKey}}
+func CRDMapFunc(secretKey types.NamespacedName, crdNames  []string) handler.MapFunc {
+	return func(object client.Object) []reconcile.Request {
+		if object.GetNamespace() != "" {
+			return nil
 		}
-	}
-	return nil
-}
-
-var _ handler.Mapper = &mapper{}
-
-type mapper struct {
-	secretKey types.NamespacedName
-	whKey     types.NamespacedName
-}
-
-func (m *mapper) Map(object handler.MapObject) []reconcile.Request {
-	if object.Meta.GetNamespace() != m.whKey.Namespace {
+		for _, crdName := range crdNames {
+			if object.GetName() == crdName {
+				return []reconcile.Request{{NamespacedName: secretKey}}
+			}
+		}
 		return nil
 	}
-	if object.Meta.GetName() != m.whKey.Name {
-		return nil
+}
+
+func MapFunc(secretKey types.NamespacedName, whKey types.NamespacedName) handler.MapFunc {
+	return func(object client.Object) []reconcile.Request {
+		if object.GetNamespace() != whKey.Namespace {
+			return nil
+		}
+		if object.GetName() != whKey.Name {
+			return nil
+		}
+		return []reconcile.Request{{NamespacedName: secretKey}}
 	}
-	return []reconcile.Request{{NamespacedName: m.secretKey}}
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -597,10 +587,9 @@ func addController(mgr manager.Manager, r *ReconcileWH) error {
 		wh.SetGroupVersionKind(webhook.gvk())
 		err = c.Watch(
 			source.NewKindWithCache(wh, r.cache),
-			&handler.EnqueueRequestsFromMapFunc{ToRequests: &mapper{
-				secretKey: r.secretKey,
-				whKey:     types.NamespacedName{Name: webhook.Name},
-			}},
+			handler.EnqueueRequestsFromMapFunc(
+				MapFunc(r.secretKey, types.NamespacedName{Name: webhook.Name}),
+			),
 		)
 		if err != nil {
 			return fmt.Errorf("watching webhook %s: %w", webhook.Name, err)
@@ -626,13 +615,12 @@ type ReconcileWH struct {
 
 // Reconcile reads that state of the cluster for a validatingwebhookconfiguration
 // object and makes sure the most recent CA cert is included
-func (r *ReconcileWH) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+func (r *ReconcileWH) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	if request.NamespacedName != r.secretKey {
 		return reconcile.Result{}, nil
 	}
 
-	stop := make(<-chan struct{})
-	if !r.cache.WaitForCacheSync(stop) {
+	if !r.cache.WaitForCacheSync(ctx) {
 		return reconcile.Result{}, errors.New("cache not ready")
 	}
 
